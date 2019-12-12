@@ -692,17 +692,19 @@ inline bool isInt64FieldType(Field::Types::Which t)
         || t == Field::Types::UInt64;
 }
 
-// Field value getter with strict type checking.
+// Field value getter with type checking in debug builds.
 template <typename T>
 T & Field::get()
 {
     using ValueType = std::decay_t<T>;
+
+#ifndef NDEBUG
     const Field::Types::Which target_field_type = TypeToEnum<NearestFieldType<ValueType>>::value;
     const bool target_is_int = isInt64FieldType(target_field_type);
     const bool source_is_int = isInt64FieldType(which);
     // Disregard signedness when converting between int64 types.
-    assert( (source_is_int && target_is_int)
-            || target_field_type == which);
+    assert((source_is_int && target_is_int) || target_field_type == which);
+#endif
 
     ValueType * MAY_ALIAS ptr = reinterpret_cast<ValueType *>(&storage);
     return *ptr;

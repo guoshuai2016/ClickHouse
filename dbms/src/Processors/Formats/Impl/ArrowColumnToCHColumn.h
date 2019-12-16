@@ -7,8 +7,10 @@
 #include <DataTypes/DataTypeDate.h>
 #include <DataTypes/DataTypeDateTime.h>
 #include <DataTypes/DataTypeString.h>
+#include <DataTypes/DataTypeArray.h>
 #include <arrow/type.h>
 #include <Columns/ColumnVector.h>
+#include <Columns/ColumnArray.h>
 #include <arrow/table.h>
 #include <arrow/array.h>
 #include <arrow/buffer.h>

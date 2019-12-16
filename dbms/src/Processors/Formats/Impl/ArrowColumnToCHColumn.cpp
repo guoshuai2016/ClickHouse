@@ -59,6 +59,19 @@ namespace DB
             // Full list of types: contrib/arrow/cpp/src/arrow/type.h
     };
 
+    static const std::initializer_list<arrow::Type::type> arrow_list_nested_type =
+	{
+			arrow::Type::INT8,
+			arrow::Type::UINT16,
+			arrow::Type::INT16,
+			arrow::Type::UINT32,
+			arrow::Type::INT32,
+			arrow::Type::UINT64,
+			arrow::Type::INT64,
+			arrow::Type::FLOAT,
+			arrow::Type::DOUBLE,
+	};
+
 /// Inserts numeric data right into internal column data to reduce an overhead
     template <typename NumericType, typename VectorType = ColumnVector<NumericType>>
     static void fillColumnWithNumericData(std::shared_ptr<arrow::Column> & arrow_column, MutableColumnPtr & internal_column)
@@ -74,6 +87,44 @@ namespace DB
 
             const auto * raw_data = reinterpret_cast<const NumericType *>(buffer->data());
             column_data.insert_assume_reserved(raw_data, raw_data + chunk->length());
+        }
+    }
+
+
+    template <typename NumericType, typename VectorType = ColumnVector<NumericType>>
+    static void fillColumnWithNumericListData(std::shared_ptr<arrow::Column> & arrow_column, MutableColumnPtr & internal_column)
+    {
+        auto & internal_nested_column = static_cast<ColumnArray &>(*internal_column).getData();
+        PaddedPODArray<NumericType> & column_data = static_cast<VectorType &>(internal_nested_column).getData();
+        PaddedPODArray<UInt64> & column_offsets = static_cast<ColumnArray &>(*internal_column).getOffsets();
+
+        size_t numeric_t_size = 0;
+        for (size_t chunk_i = 0, num_chunks = static_cast<size_t>(arrow_column->data()->num_chunks()); chunk_i < num_chunks; ++chunk_i)
+        {
+            arrow::ListArray & chunk = static_cast<arrow::ListArray &>(*(arrow_column->data()->chunk(chunk_i)));
+            const int64_t chunk_length = chunk.length();
+
+            numeric_t_size += chunk.value_offset(chunk_length - 1) + chunk.value_length(chunk_length - 1);
+        }
+        column_data.reserve(numeric_t_size);
+        column_offsets.reserve(arrow_column->length());
+
+        for (size_t chunk_i = 0, num_chunks = static_cast<size_t>(arrow_column->data()->num_chunks()); chunk_i < num_chunks; ++chunk_i)
+        {
+            arrow::ListArray & chunk = static_cast<arrow::ListArray &>(*(arrow_column->data()->chunk(chunk_i)));
+            /// buffers[0] is a null bitmap and buffers[1] are actual values
+            std::shared_ptr<arrow::Buffer> buffer = chunk.values()->data()->buffers[1];
+            const int64_t chunk_length = chunk.length();
+
+            for (int64_t offset_i = 0; offset_i != chunk_length; ++offset_i)
+            {
+                if (!chunk.IsNull(offset_i) && buffer)
+                {
+                    const auto * raw_data = reinterpret_cast<const NumericType *>(buffer->data()) + chunk.value_offset(offset_i);
+                    column_data.insert_assume_reserved(raw_data, raw_data + chunk.value_length(offset_i));
+                }
+                column_offsets.emplace_back(column_data.size());
+            }
         }
     }
 
@@ -305,6 +356,24 @@ namespace DB
                 internal_nested_type = std::make_shared<DataTypeDecimal<Decimal128>>(decimal_type->precision(),
                                                                                      decimal_type->scale());
             }
+            else if (arrow_type == arrow::Type::LIST)
+            {
+                arrow::ListType * list_type = static_cast<arrow::ListType *>(arrow_column->type().get());
+                arrow::Type::type list_nested_type = list_type->value_type()->id();
+
+                if (std::find(arrow_list_nested_type.begin(), arrow_list_nested_type.end(), list_nested_type) != arrow_list_nested_type.end())
+                {
+                    auto internal_type_it = std::find_if(arrow_type_to_internal_type.begin(), arrow_type_to_internal_type.end(), [=](auto && elem) { return elem.first == list_nested_type; });
+
+                    internal_nested_type = std::make_shared<DataTypeArray>(DataTypeFactory::instance().get(internal_type_it->second));
+                }
+                else
+                {
+                    throw Exception{"The nested type \"" + list_type->value_type()->name() + "\" of an List input column \"" + arrow_column->name()
+                                    + "\" is not supported for conversion from a " + format_name + " data format",
+                                    ErrorCodes::CANNOT_CONVERT_TYPE};
+                }
+            }
             else if (auto internal_type_it = std::find_if(arrow_type_to_internal_type.begin(), arrow_type_to_internal_type.end(),
                 [=](auto && elem) { return elem.first == arrow_type; });
                 internal_type_it != arrow_type_to_internal_type.end())
@@ -367,6 +436,24 @@ namespace DB
 
                 FOR_ARROW_NUMERIC_TYPES(DISPATCH)
 #    undef DISPATCH
+
+                case arrow::Type::LIST:
+                {
+                    arrow::ListType *list_type = static_cast<arrow::ListType *>(arrow_column->type().get());
+                    arrow::Type::type list_nested_type = list_type->value_type()->id();
+                    switch (list_nested_type) {
+#    define DISPATCH(ARROW_NUMERIC_TYPE, CPP_NUMERIC_TYPE) \
+                        case ARROW_NUMERIC_TYPE: \
+                            fillColumnWithNumericListData<CPP_NUMERIC_TYPE>(arrow_column, read_column); \
+                            break;
+
+                        FOR_ARROW_NUMERIC_TYPES(DISPATCH)
+                        default:
+                            break;
+#    undef DISPATCH
+                    }
+                    break;
+                }
                     // TODO: support TIMESTAMP_MICROS and TIMESTAMP_MILLIS with truncated micro- and milliseconds?
                     // TODO: read JSON as a string?
                     // TODO: read UUID as a string?
